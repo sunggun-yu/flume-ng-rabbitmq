@@ -19,16 +19,21 @@
 
 package org.apache.flume.sink.rabbitmq;
 
-import com.rabbitmq.client.BasicProperties;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.ConnectionFactory;
-import com.rabbitmq.client.impl.AMQBasicProperties;
-import org.apache.flume.*;
+import org.apache.flume.Context;
+import org.apache.flume.CounterGroup;
+import org.apache.flume.Event;
+import org.apache.flume.EventDeliveryException;
+import org.apache.flume.RabbitMQConstants;
+import org.apache.flume.RabbitMQUtil;
+import org.apache.flume.Transaction;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.sink.AbstractSink;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+import com.rabbitmq.client.ConnectionFactory;
 
 public class RabbitMQSink extends AbstractSink implements Configurable {
     private static final Logger log = LoggerFactory.getLogger(RabbitMQSink.class);
@@ -38,24 +43,26 @@ public class RabbitMQSink extends AbstractSink implements Configurable {
     private Channel _Channel;
     private String _QueueName;
     private String _ExchangeName;
+    private int batchSize = RabbitMQConstants.DEFAULT_BATCH_SIZE;
     
     public RabbitMQSink(){
         _CounterGroup=new CounterGroup();
     }
-    
+
     @Override
     public void configure(Context context) {
         _ConnectionFactory = RabbitMQUtil.getFactory(context);
         _QueueName = RabbitMQUtil.getQueueName(context);
-        _ExchangeName= RabbitMQUtil.getExchangeName(context);        
+        _ExchangeName= RabbitMQUtil.getExchangeName(context);
+        batchSize = context.getInteger(RabbitMQConstants.CONFIG_BATCH_SIZE, RabbitMQConstants.DEFAULT_BATCH_SIZE);
     }
 
     @Override
     public synchronized void stop() {
-        RabbitMQUtil.close(_Connection, _Channel);      
+        RabbitMQUtil.close(_Connection, _Channel);
         super.stop();
     }
-    
+
     private void resetConnection(){
         _CounterGroup.incrementAndGet(RabbitMQConstants.COUNTER_EXCEPTION);
         if(log.isWarnEnabled())log.warn(this.getName() + " - Closing RabbitMQ connection and channel due to exception.");
@@ -63,14 +70,14 @@ public class RabbitMQSink extends AbstractSink implements Configurable {
         _Connection=null;
         _Channel=null;
     }
-    
+
     @Override
     public Status process() throws EventDeliveryException {
         if(null==_Connection){
             try {
                 if(log.isInfoEnabled())log.info(this.getName() + " - Opening connection to " + _ConnectionFactory.getHost() + ":" + _ConnectionFactory.getPort());
                 _Connection = _ConnectionFactory.newConnection();
-                _CounterGroup.incrementAndGet(RabbitMQConstants.COUNTER_NEW_CONNECTION);               
+                _CounterGroup.incrementAndGet(RabbitMQConstants.COUNTER_NEW_CONNECTION);
                 _Channel = null;
             } catch(Exception ex) {
                 if(log.isErrorEnabled()) log.error(this.getName() + " - Exception while establishing connection.", ex);
@@ -78,7 +85,7 @@ public class RabbitMQSink extends AbstractSink implements Configurable {
                 return Status.BACKOFF;
             }            
         }
-        
+
         if(null==_Channel){
             try {
                 if(log.isInfoEnabled())log.info(this.getName() + " - creating channel...");
@@ -89,43 +96,48 @@ public class RabbitMQSink extends AbstractSink implements Configurable {
                 if(log.isErrorEnabled()) log.error(this.getName() + " - Exception while creating channel.", ex);
                 resetConnection();
                 return Status.BACKOFF;
-            }             
+            }
         }
-        
+
         Transaction tx = getChannel().getTransaction();
-
+        Status result = Status.READY;
         try {
+            long grandBegin = System.currentTimeMillis();
             tx.begin();
-            
-            Event e = getChannel().take();
+            log.info("Start batch : {}", batchSize);
+            for (int i = 0; i < batchSize; i++) {
+                long takeBegin = System.currentTimeMillis();
+                Event e = getChannel().take();
+                long takeEnd = System.currentTimeMillis();
+                log.info("[{}] Message taking : {} ms", i, takeEnd - takeBegin);
+                if (e != null) {
+                    long begin = System.currentTimeMillis();
+                    _Channel.basicPublish(_ExchangeName, _QueueName, null, e.getBody());
+                    long end = System.currentTimeMillis();
+                    log.info("[{}] Published : {} ms", i, end - begin);
 
-            if(e==null){
-                tx.rollback();
-                return Status.BACKOFF;
+                    begin = System.currentTimeMillis();
+                    _CounterGroup.incrementAndGet(RabbitMQConstants.COUNTER_PUBLISH);
+                    end = System.currentTimeMillis();
+                    log.info("[{}] Complte - increase counter : {} ms", i, end - begin);
+                } else {
+                    result = Status.BACKOFF;
+                    break;
+                }
             }
-            
-            try {
-                _Channel.basicPublish(_ExchangeName, _QueueName, null, e.getBody());
-                tx.commit();
-                _CounterGroup.incrementAndGet(RabbitMQConstants.COUNTER_PUBLISH);
-            } catch(Exception ex){
-                resetConnection();
-                throw ex;
-            }
-            
-            return Status.READY;
+            long commitBegin = System.currentTimeMillis();
+            tx.commit();
+            long grandEnd = System.currentTimeMillis();
 
+            log.info("Commited : {} ms", grandEnd - commitBegin);
+            log.info("Finish batch : {} ms", grandEnd - grandBegin);
         } catch (Exception ex) {
-         
-          tx.rollback();
-          
-          if(log.isErrorEnabled())
-              log.error(this.getName() + " - Exception while publishing...", ex);
-          
-          return Status.BACKOFF;
-
+            tx.rollback();
+            resetConnection();
+            throw new EventDeliveryException("Failed to process transaction", ex);
         } finally {
             tx.close();
-        }   
-    }   
+        }
+        return result;
+    }
 }
